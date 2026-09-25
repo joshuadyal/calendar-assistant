@@ -3,6 +3,7 @@ venv/
 .venv/
 src/__pycache__/
 __pycache__/
+logs/
 *.pyc
 token.json
 credentials.json

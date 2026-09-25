@@ -1,15 +1,13 @@
 import datetime
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from auth import calendar_auth
 from definitions import DateTimeInput
 from helpers import parse_datetimeinput
 
 
 class CalendarService:
-    def __init__(self):
-        self.__creds = calendar_auth()
-        self.__service = build("calendar", "v3", credentials=self.__creds)
+    def __init__(self, credentials):
+        self.__service = build("calendar", "v3", credentials=credentials)
 
     def _format_event(self, event):
         return {

@@ -1,8 +1,11 @@
 import os
+from contextvars import ContextVar
 from calendar_service import CalendarService
 from helpers import parse_datetimeinput
 from dotenv import load_dotenv
 from logger import logger
+from guardrails import InputGuardrail
+from auth import calendar_auth
 
 # from langchain_ollama import ChatOllama
 from langchain_openai import ChatOpenAI
@@ -12,14 +15,32 @@ from langchain.agents.middleware import HumanInTheLoopMiddleware
 from langchain_core.tools import tool
 from langchain_core.utils.uuid import uuid7
 from langchain_core.runnables import Runnable
-from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
 
-from definitions import DateTimeInput
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+
+from definitions import DateTimeInput, CalendarAgentResponse
 
 load_dotenv()
 
-calendar_service = CalendarService()
+calendar_service: CalendarService | None = None
+request_calendar_service: ContextVar[CalendarService | None] = ContextVar(
+    "request_calendar_service", default=None
+)
+
+
+def _get_calendar_service() -> CalendarService:
+    scoped_service = request_calendar_service.get()
+    if scoped_service is not None:
+        return scoped_service
+
+    global calendar_service
+
+    if calendar_service is None:
+        calendar_service = CalendarService(calendar_auth())
+
+    return calendar_service
 
 
 @tool
@@ -37,7 +58,7 @@ def view_calendar(start: DateTimeInput, end: DateTimeInput, limit: int | None):
         parse_datetimeinput(start).isoformat(),
         parse_datetimeinput(end).isoformat(),
     )
-    result = calendar_service.get_events(start, end, limit)
+    result = _get_calendar_service().get_events(start, end, limit)
     is_result_success = not not result or type(result) is list
     if is_result_success:
         logger.info(
@@ -67,7 +88,7 @@ def get_event(event_id: str):
     """
 
     logger.info("Tool called | tool=get_event | event_id=%s", event_id)
-    result = calendar_service.get_event(event_id)
+    result = _get_calendar_service().get_event(event_id)
     is_result_success = not not result
     if is_result_success:
         logger.info("Tool completed | tool=get_event | success=%s", result)
@@ -91,7 +112,7 @@ def get_busy_periods(start: DateTimeInput, end: DateTimeInput):
         parse_datetimeinput(start).isoformat(),
         parse_datetimeinput(end).isoformat(),
     )
-    result = calendar_service.get_busy_periods(start, end)
+    result = _get_calendar_service().get_busy_periods(start, end)
     is_result_success = not not result or type(result) is list
     if is_result_success:
 
@@ -126,7 +147,7 @@ def is_available(start: DateTimeInput, end: DateTimeInput) -> bool:
         parse_datetimeinput(start).isoformat(),
         parse_datetimeinput(end).isoformat(),
     )
-    result = calendar_service.is_available(start, end)
+    result = _get_calendar_service().is_available(start, end)
     is_result_success = True if result == True or result == False else False
     if is_result_success:
         logger.info(
@@ -175,7 +196,7 @@ def create_event(
         parse_datetimeinput(start).isoformat(),
         parse_datetimeinput(end).isoformat(),
     )
-    result = calendar_service.create_event(
+    result = _get_calendar_service().create_event(
         summary, start, end, description, location, recurrence
     )
     is_result_success = not not result
@@ -217,7 +238,7 @@ def update_event(
         location: where the event will take place
     """
     logger.info("Tool called | tool=update_event | event_id=%s", event_id)
-    result = calendar_service.update_event(
+    result = _get_calendar_service().update_event(
         event_id, summary, start, end, description, location
     )
     is_result_success = not not result
@@ -240,7 +261,7 @@ def delete_event(event_id: str) -> bool:
         event_id: the event's id
     """
     logger.info("Tool called | tool=delete_event | event_id=%s", event_id)
-    result = calendar_service.delete_event(event_id)
+    result = _get_calendar_service().delete_event(event_id)
     is_result_success = not not result
     if is_result_success:
         logger.info("Tool completed | tool=delete_event | success=%s", result)
@@ -249,14 +270,8 @@ def delete_event(event_id: str) -> bool:
     return result
 
 
-def main():
-    """Shows basic usage of the Google Calendar API.
-    Prints the start and name of the next 10 events on the user's calendar.
-    """
-
-    print("""Welcome to your personal calendar assistant!""")
-
-    # llm = ChatOllama(model="qwen3:8b", num_ctx=8192)
+def build_agent() -> Runnable:
+    """Build the calendar agent with a PostgreSQL conversation checkpointer."""
     model = ChatOpenAI(
         model="gpt-5-mini",
         temperature=0,
@@ -268,7 +283,12 @@ def main():
         # organization="...",
         # other params...
     )
-    checkpointer = InMemorySaver()
+
+    checkpointer = InMemorySaver(
+        serde=JsonPlusSerializer(
+            allowed_msgpack_modules=[("definitions", "CalendarAgentResponse")]
+        )
+    )
 
     system_prompt = """
     You are a personal calendar assistant.
@@ -304,6 +324,7 @@ def main():
             delete_event,
         ],
         middleware=[
+            InputGuardrail(),
             HumanInTheLoopMiddleware(
                 interrupt_on={
                     "create_event": True,
@@ -316,9 +337,19 @@ def main():
                 }
             ),
         ],
+        response_format=CalendarAgentResponse,
         system_prompt=system_prompt,
         checkpointer=checkpointer,
     )
+
+    return agent
+
+
+def main():
+    """Run the calendar agent in the terminal."""
+
+    print("""Welcome to your personal calendar assistant!""")
+    agent = build_agent()
 
     thread_id = str(uuid7())
     config = {"configurable": {"thread_id": thread_id}}
@@ -391,8 +422,7 @@ def main():
 
         for kind, item in stream.interleave("messages", "tool_calls"):
             if kind == "messages":
-                for token in item.text:
-                    print(token, end="", flush=True)
+                print(type(item.text))
 
             elif kind == "tool_calls":
 
@@ -406,7 +436,15 @@ def main():
         if state.interrupts:
             continue
 
-        final_state = stream.output
+        structured_response = state.values.get("structured_response")
+
+        if structured_response:
+            print("\n")
+            print(f"Status: {structured_response.status}")
+            print(f"Message: {structured_response.message}")
+
+            if structured_response.events_affected:
+                print(f"Events affected: " f"{structured_response.events_affected}")
 
 
 if __name__ == "__main__":
